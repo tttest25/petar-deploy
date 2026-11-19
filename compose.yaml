@@ -1,0 +1,85 @@
+x-existing-path: &existing-path
+  create_host_path: false
+
+services:
+  postgres:
+    image: "${POSTGRES_IMAGE:?select the PostgreSQL 18 image}"
+    restart: unless-stopped
+    shm_size: 128mb
+    mem_limit: 450m
+    environment:
+      POSTGRES_DB: petar_db
+      POSTGRES_USER: petar_user
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set a URL-safe local password}"
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:?select an environment}:5432"
+    volumes:
+      - type: bind
+        source: "${POSTGRES_DATA_DIR:?select an environment}"
+        target: /var/lib/postgresql
+        bind: *existing-path
+      - type: bind
+        source: "${POSTGRES_FILES_DIR:?select the PostgreSQL files}/bootstrap.sh"
+        target: /docker-entrypoint-initdb.d/10-petar.sh
+        read_only: true
+        bind: *existing-path
+      - type: bind
+        source: "${POSTGRES_FILES_DIR:?select the PostgreSQL files}/migrations"
+        target: /migrations
+        read_only: true
+        bind: *existing-path
+      - type: bind
+        source: "${POSTGRES_FILES_DIR:?select the PostgreSQL files}/postgresql.conf"
+        target: /etc/postgresql/postgresql.conf
+        read_only: true
+        bind: *existing-path
+      - type: bind
+        source: "${SPOOL_DIR:?select an environment}"
+        target: /spool
+        bind: *existing-path
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "petar_user", "-d", "petar_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    image: "${APP_IMAGE:?select the application image}"
+    restart: unless-stopped
+    environment:
+      DB_DSN: "postgres://petar_user:${POSTGRES_PASSWORD:?set a URL-safe local password}@postgres:5432/petar_db?sslmode=disable"
+      SPOOL_DIR: /app/spool
+      HTTP_ADDR: 0.0.0.0:8080
+    ports:
+      - "127.0.0.1:${API_PORT:?select an environment}:8080"
+    volumes:
+      - type: bind
+        source: "${SPOOL_DIR:?select an environment}"
+        target: /app/spool
+        bind: *existing-path
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      default:
+        aliases: [petar_app]
+
+  dokuwiki:
+    image: "${DOKUWIKI_IMAGE:?select the DokuWiki image}"
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+    ports:
+      - "${WIKI_BIND_IP:?select an environment}:${WIKI_PORT:?select an environment}:80"
+    volumes:
+      - type: bind
+        source: "${WIKI_DATA_DIR:?select an environment}"
+        target: /config
+        bind: *existing-path
+      - type: bind
+        source: "${PLUGIN_DIR:?select the plugin directory}"
+        target: /config/dokuwiki/lib/plugins/petar
+        read_only: true
+        bind: *existing-path
