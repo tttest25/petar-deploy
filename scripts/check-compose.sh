@@ -108,7 +108,8 @@ for env_name in "${environments[@]}"; do
       port("127.0.0.1"; $pg; 5432) and .image == $pg_image and (has("build") | not) and
       .environment.POSTGRES_PASSWORD == $password and
       (.healthcheck.disable // false) == false and
-      .healthcheck.test == ["CMD", "pg_isready", "-U", "petar_user", "-d", "petar_db"] and
+      .healthcheck.test == ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "petar_user", "-d", "petar_db"] and
+      .healthcheck.start_period == "1m30s" and
       mounts([
         bind("/opt/go-pet/postgres/deploy/" + $e + "/data"; "/var/lib/postgresql"; false),
         bind($pg_dir + "/bootstrap.sh"; "/docker-entrypoint-initdb.d/10-petar.sh"; true),

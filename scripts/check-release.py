@@ -86,14 +86,18 @@ def read_archive(path, expected_digest, expected):
     # Read and hash the same bytes that are passed to the parser.
     with path.open("rb") as file:
         compressed = file.read(MAX_BUNDLE + 1)
+    return read_archive_bytes(path.name, compressed, expected_digest, expected)
+
+
+def read_archive_bytes(name, compressed, expected_digest, expected):
     if len(compressed) > MAX_BUNDLE or hashlib.sha256(compressed).hexdigest() != expected_digest:
-        raise ValueError(f"{path.name}: SHA-256 mismatch or archive too large")
+        raise ValueError(f"{name}: SHA-256 mismatch or archive too large")
     decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
     plain = decoder.decompress(compressed, MAX_BUNDLE + 1)
     if len(plain) > MAX_BUNDLE:
-        raise ValueError(f"{path.name}: uncompressed archive too large")
+        raise ValueError(f"{name}: uncompressed archive too large")
     if not decoder.eof or decoder.unused_data:
-        raise ValueError(f"{path.name}: expected one complete gzip member")
+        raise ValueError(f"{name}: expected one complete gzip member")
     contents = {}
     next_header = 0
     with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as archive:
@@ -108,15 +112,15 @@ def read_archive(path, expected_digest, expected):
                 or member.offset != next_header
                 or member.offset_data != next_header + tarfile.BLOCKSIZE
             ):
-                raise ValueError(f"{path.name}: unexpected archive member or mode")
+                raise ValueError(f"{name}: unexpected archive member or mode")
             contents[member.name] = archive.extractfile(member).read()
             next_header = member.offset_data + member.size
             next_header += -next_header % tarfile.BLOCKSIZE
     tail = plain[next_header:]
     if len(tail) < 2 * tarfile.BLOCKSIZE or len(tail) % tarfile.BLOCKSIZE or any(tail):
-        raise ValueError(f"{path.name}: unexpected data after archive files")
+        raise ValueError(f"{name}: unexpected data after archive files")
     if contents.keys() != expected.keys():
-        raise ValueError(f"{path.name}: archive files missing")
+        raise ValueError(f"{name}: archive files missing")
     return contents
 
 
@@ -162,60 +166,101 @@ def read_local(local_path):
 
 
 def check_rehearsal(pins, local, model):
+    return check_runtime(pins, local, model, "rehearsal", {
+        "WIKI_DATA_DIR": "/opt/petar-data/rehearsal/wiki",
+        "SPOOL_DIR": "/opt/petar-data/rehearsal/spool",
+        "POSTGRES_DATA_DIR": "/opt/go-pet/postgres/deploy/rehearsal/data",
+        "POSTGRES_PORT": "5434", "API_PORT": "8082", "WIKI_PORT": "82",
+        "WIKI_BIND_IP": "127.0.0.1",
+    })
+
+
+def check_runtime(pins, local, model, profile, layout, dev_context="/opt/go-pet"):
     pg_files, plugin = local["POSTGRES_FILES_DIR"], local["PLUGIN_DIR"]
-    wiki = "/opt/petar-data/rehearsal/wiki"
-    spool = "/opt/petar-data/rehearsal/spool"
-    pgdata = "/opt/go-pet/postgres/deploy/rehearsal/data"
+    wiki, spool, pgdata = (layout[key] for key in ("WIKI_DATA_DIR", "SPOOL_DIR", "POSTGRES_DATA_DIR"))
+    project = "petar-" + profile
     expected = {
-        "postgres": ("POSTGRES_IMAGE", 5434, 5432, [
+        "postgres": ("POSTGRES_IMAGE", layout["POSTGRES_PORT"], 5432, [
             (pgdata, "/var/lib/postgresql", False),
             (pg_files + "/bootstrap.sh", "/docker-entrypoint-initdb.d/10-petar.sh", True),
             (pg_files + "/migrations", "/migrations", True),
             (pg_files + "/postgresql.conf", "/etc/postgresql/postgresql.conf", True),
             (spool, "/spool", False),
         ]),
-        "app": ("APP_IMAGE", 8082, 8080, [(spool, "/app/spool", False)]),
-        "dokuwiki": ("DOKUWIKI_IMAGE", 82, 80, [
+        "app": ("APP_IMAGE", layout["API_PORT"], 8080, [(spool, "/app/spool", False)]),
+        "dokuwiki": ("DOKUWIKI_IMAGE", layout["WIKI_PORT"], 80, [
             (wiki, "/config", False),
             (plugin, "/config/dokuwiki/lib/plugins/petar", True),
         ]),
     }
     services, networks = model["services"], model["networks"]
+    allowed = {"image", "restart", "environment", "ports", "volumes",
+               "entrypoint", "command", "networks"}
+    additional = {
+        "postgres": {"shm_size", "mem_limit", "healthcheck"},
+        "app": {"depends_on"} | ({"build", "pull_policy"} if profile == "dev" else set()),
+        "dokuwiki": set(),
+    }
     if (
-        model["name"] != "petar-rehearsal"
+        model["name"] != project
+        or model.keys() - {"name", "services", "networks", "x-existing-path"}
         or services.keys() != expected.keys()
-        or networks.keys() != {"default"}
-        or networks["default"]["name"] != "petar-rehearsal_default"
-        or networks["default"].get("external", False)
+        or networks != {"default": {"name": project + "_default", "ipam": {}}}
     ):
-        raise ValueError("unexpected rehearsal project, service set or network")
+        raise ValueError("unexpected project, service set or network")
     for name, (key, published, target, mounts) in expected.items():
         service = services[name]
         ports = service.get("ports", [])
         volumes = service.get("volumes", [])
         actual = [(v["source"], v["target"], v.get("read_only", False)) for v in volumes]
+        build = profile == "dev" and name == "app"
         if (
             service["image"] != pins[key]
-            or any(field in service for field in ("build", "container_name", "network_mode"))
-            or service["networks"].keys() != {"default"}
+            or service.keys() - allowed - additional[name]
+            or service.get("restart") != "unless-stopped"
+            or (build and (service.get("build") != {
+                "context": dev_context, "dockerfile": "Dockerfile", "network": "host",
+            } or service.get("pull_policy") != "build"))
+            or (not build and "build" in service)
+            or service.get("entrypoint") is not None
+            or service.get("command") != (["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+                                          if name == "postgres" else None)
+            or service["networks"] != {"default": {"aliases": ["petar_app"]} if name == "app" else None}
             or len(ports) != 1
-            or ports[0].get("host_ip") != "127.0.0.1"
+            or ports[0].get("host_ip") != (layout["WIKI_BIND_IP"] if name == "dokuwiki" else "127.0.0.1")
             or str(ports[0].get("published")) != str(published)
             or ports[0].get("target") != target
             or ports[0].get("protocol") != "tcp"
+            or ports[0].get("mode") != "ingress"
+            or ports[0].keys() - {"mode", "host_ip", "target", "published", "protocol"}
             or sorted(actual) != sorted(mounts)
-            or any(v.get("type") != "bind" or not isinstance(v.get("bind"), dict)
-                   or v["bind"].get("create_host_path", False) is not False
+            or any(v.keys() - {"type", "source", "target", "read_only", "bind"}
+                   or v.get("type") != "bind" or not isinstance(v.get("bind"), dict)
+                   or v["bind"] not in ({}, {"create_host_path": False})
                    for v in volumes)
         ):
-            raise ValueError(f"unexpected rehearsal configuration for {name}")
+            raise ValueError(f"unexpected configuration for {name}")
     password = local["POSTGRES_PASSWORD"]
     if (
-        services["postgres"]["environment"].get("POSTGRES_PASSWORD") != password
-        or services["app"]["environment"].get("DB_DSN")
-        != f"postgres://petar_user:{password}@postgres:5432/petar_db?sslmode=disable"
+        services["postgres"]["environment"] != {
+            "POSTGRES_PASSWORD": password, "POSTGRES_USER": "petar_user", "POSTGRES_DB": "petar_db",
+        }
+        or services["app"]["environment"] != {
+            "DB_DSN": f"postgres://petar_user:{password}@postgres:5432/petar_db?sslmode=disable",
+            "SPOOL_DIR": "/app/spool", "HTTP_ADDR": "0.0.0.0:8080",
+        }
+        or services["dokuwiki"]["environment"] != {"PUID": "1000", "PGID": "1000"}
+        or services["app"].get("depends_on") != {
+            "postgres": {"condition": "service_healthy", "required": True},
+        }
+        or services["postgres"].get("healthcheck") != {
+            "test": ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "petar_user", "-d", "petar_db"],
+            "interval": "5s", "timeout": "5s", "start_period": "1m30s", "retries": 5,
+        }
+        or services["postgres"].get("mem_limit") != "471859200"
+        or services["postgres"].get("shm_size") != "134217728"
     ):
-        raise ValueError("unexpected rehearsal credentials or database target")
+        raise ValueError("unexpected credentials or database target")
     return next(v["source"] for v in services["dokuwiki"]["volumes"] if v["target"] == "/config")
 
 

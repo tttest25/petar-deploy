@@ -1,0 +1,6 @@
+# DEPLOY-06 template only. Do not install before scheduling is approved.
+SHELL=/bin/sh
+HOME=/home/eam
+PATH=/usr/bin:/bin
+MAILTO=""
+* * * * * eam /opt/petar-deploy/scripts/run-once.sh production >> /opt/petar-data/production/operator/runner.log 2>&1

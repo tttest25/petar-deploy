@@ -1,6 +1,6 @@
 services:
   app:
     build:
-      context: /opt/go-pet
+      context: ${DEV_BUILD_CONTEXT:-/opt/go-pet}
       network: host
     pull_policy: build

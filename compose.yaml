@@ -39,7 +39,8 @@ services:
         bind: *existing-path
     command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "petar_user", "-d", "petar_db"]
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "petar_user", "-d", "petar_db"]
+      start_period: 90s
       interval: 5s
       timeout: 5s
       retries: 5

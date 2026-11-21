@@ -1,0 +1,11 @@
+# DEPLOY-06 template only. Rotate wrapper outcomes, not raw runner output.
+/opt/petar-data/production/operator/runner.log {
+    su eam eam
+    create 0600 eam eam
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+}

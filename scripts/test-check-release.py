@@ -56,6 +56,11 @@ class ReleaseChecks(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         CHECK["read_archive"](path, hashlib.sha256(data).hexdigest(), expected)
 
+    def test_archive_oversize_inflation_is_a_controlled_refusal(self):
+        data = gzip.compress(b"\0" * (CHECK["MAX_BUNDLE"] + 1))
+        with self.assertRaisesRegex(ValueError, "fixture: uncompressed archive too large"):
+            CHECK["read_archive_bytes"]("fixture", data, hashlib.sha256(data).hexdigest(), {})
+
     def test_rehearsal_checks_effective_model(self):
         pins = CHECK["read_manifest"](MANIFEST)
         with tempfile.TemporaryDirectory() as scratch:
@@ -78,6 +83,9 @@ class ReleaseChecks(unittest.TestCase):
                 (("services", "dokuwiki", "ports", 0, "host_ip"), "0.0.0.0"),
                 (("services", "dokuwiki", "volumes", 0, "source"), "/opt/petar-data/production/wiki"),
                 (("services", "app", "environment", "DB_DSN"), "unexpected"),
+                (("services", "app", "ipc"), "host"),
+                (("services", "app", "logging"), {"driver": "json-file", "options": {"env": "DB_DSN"}}),
+                (("services", "postgres", "healthcheck", "test"), ["CMD", "pg_isready"]),
             ):
                 with self.subTest(path=path):
                     changed = deepcopy(model)
