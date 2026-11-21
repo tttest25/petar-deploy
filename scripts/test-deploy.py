@@ -137,6 +137,12 @@ elif tool == "docker":
                 assert not any(p.startswith(("postgres", "spool", ".git")) for p in contents)
             else:
                 assert build is None
+                spool = Path(next(v["source"] for v in m["services"]["app"]["volumes"]
+                                  if v["target"] == "/app/spool"))
+                assert {p.name for p in spool.iterdir()} == {"in", "processing", "out"}
+                for entry in spool.iterdir():
+                    assert entry.is_dir() and not any(entry.iterdir())
+                    assert entry.stat().st_mode & 0o777 == 0o700
             assert "--pull" in args and args[args.index("--pull")+1] == "never"
             containers = []
             for service, s in m["services"].items():

@@ -1,0 +1,288 @@
+---
+- name: Prepare the DEPLOY-07 acceptance guest
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    smoke_home: /opt/petar-smoke
+    chromium_version: 148.0.7778.96
+    chromium_sha256: 88817c574c1838a39f88fda0bbd043b4481fd385fb10e92c323e230844d636ce
+    fixture_parents:
+      - /opt/go-pet
+      - /opt/go-pet/postgres
+      - /opt/go-pet/postgres/deploy
+      - /opt/go-pet/postgres/deploy/dev
+      - /opt/go-pet/postgres/deploy/rehearsal
+      - /opt/go-pet/postgres/deploy/production
+      - /opt/php-wiki-plugin
+      - /opt/petar-deploy
+      - /opt/petar-data
+      - /opt/petar-data/dev
+      - /opt/petar-data/rehearsal
+      - /opt/petar-data/production
+  tasks:
+    - name: Require explicit designation and verify the guest before any changes
+      ansible.builtin.shell: |
+        set -eu
+        test "$CONFIRMED_DISPOSABLE" = yes
+        test "$(id -u):$(id -g)" = 1000:1000
+        test "$(uname -m)" = x86_64
+        case "$(systemd-detect-virt --vm)" in kvm|qemu) ;; *) exit 1;; esac
+        test "$(systemd-detect-virt --container || true)" = none
+        test "$(findmnt -T /opt -no FSTYPE)" = ext4
+        mount_targets=$(findmnt -rn -o TARGET)
+        if printf '%s\n' "$mount_targets" | grep -Eq '^/opt(/|$)'; then exit 1; fi
+        . /etc/os-release
+        test "$ID:$VERSION_ID" = ubuntu:26.04
+        test "$(systemctl is-active cron || true)" = inactive
+        port_listeners=$(ss -H -ltn '( sport = :82 or sport = :8082 or sport = :5434 )')
+        test -z "$port_listeners"
+        # Separate assignments matter: an unreadable directory is not empty.
+        opt_children=$(ls -A -- /opt)
+        if test -S /run/docker.sock; then
+          test "$REUSE_ATTESTED" = yes
+          test "$opt_children" = containerd
+          /usr/bin/python3 - <<'PY'
+        import socket, stat, struct
+        from pathlib import Path
+        marker = Path('/etc/petar-deploy-disposable')
+        mode = marker.lstat()
+        assert stat.S_ISREG(mode.st_mode) and mode.st_uid == 0 and not mode.st_mode & 0o022
+        assert marker.read_bytes() == Path('/etc/machine-id').read_bytes()
+        path = Path('/run/docker.sock')
+        assert path.stat().st_uid == 0 and stat.S_ISSOCK(path.stat().st_mode)
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(str(path))
+            pid, uid, _ = struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        assert uid == 0 and Path(f'/proc/{pid}/comm').read_text().strip() == 'dockerd'
+        PY
+          containers=$(/usr/bin/docker --host=unix:///run/docker.sock ps -aq)
+          volumes=$(/usr/bin/docker --host=unix:///run/docker.sock volume ls -q)
+          networks=$(/usr/bin/docker --host=unix:///run/docker.sock network ls --format '{% raw %}{{.Name}}{% endraw %}')
+          test -z "$containers"
+          test -z "$volumes"
+          test "$(printf '%s\n' "$networks" | sort | paste -sd,)" = bridge,host,none
+        else
+          test "$REUSE_ATTESTED" = no
+          test -z "$opt_children"
+          daemon_processes=$(ps -eo comm)
+          if printf '%s\n' "$daemon_processes" | grep -Eq '^(dockerd|containerd)$'; then exit 1; fi
+          # Check as root; an absent Unix socket does not rule out stopped Docker
+          # storage or a custom daemon configuration.
+          /usr/bin/sudo -n /bin/sh -ec '
+            for p in /run/docker.sock /run/containerd/containerd.sock \
+              /etc/petar-deploy-disposable /etc/docker /etc/containerd \
+              /etc/petar-acceptance-docker.json /etc/systemd/system/petar-acceptance-docker.service \
+              /var/lib/docker /opt/containerd /var/lib/containerd /var/lib/petar-acceptance-docker; do
+              if test -e "$p" || test -L "$p"; then
+                printf "Fresh guest required; pre-existing resource: %s\n" "$p" >&2
+                exit 1
+              fi
+            done
+          '
+        fi
+        operator_record=$(getent passwd 1000)
+        operator_name=${operator_record%%:*}
+        test -n "$operator_name"
+        test "$(id -u "$operator_name"):$(id -g "$operator_name")" = 1000:1000
+        printf '%s\n' "$operator_name"
+      environment:
+        CONFIRMED_DISPOSABLE: "{{ confirmed_disposable | default('no') }}"
+        REUSE_ATTESTED: "{{ reuse_attested | default('no') }}"
+      changed_when: false
+      register: verified_operator
+
+    - name: Install guest-only prerequisites without package auto-start
+      become: true
+      ansible.builtin.apt:
+        name:
+          - apparmor
+          - ca-certificates
+          - curl
+          - docker.io
+          - docker-compose-v2
+          - fontconfig
+          - fonts-dejavu-core
+          - gnu-coreutils
+          - iproute2
+          - jq
+          - libasound2t64
+          - libatk-bridge2.0-0t64
+          - libatk1.0-0t64
+          - libdrm2
+          - libgbm1
+          - libglib2.0-0t64
+          - libnspr4
+          - libnss3
+          - libx11-6
+          - libxcb1
+          - libxcomposite1
+          - libxdamage1
+          - libxext6
+          - libxfixes3
+          - libxkbcommon0
+          - libxrandr2
+          - python3-venv
+          - unzip
+        state: present
+        update_cache: true
+        install_recommends: false
+        policy_rc_d: 101
+
+    - name: Stop packaged socket activation on a fresh guest only
+      become: true
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop: [docker.service, docker.socket]
+      when: reuse_attested | default('no') != 'yes'
+
+    - name: Mask the packaged Docker socket and service on the fresh guest
+      become: true
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        masked: true
+      loop: [docker.service, docker.socket]
+      when: reuse_attested | default('no') != 'yes'
+
+    - name: Configure a socket opened directly by dockerd on a fresh guest
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/petar-acceptance-docker.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Disposable Petar acceptance Docker daemon
+          After=containerd.service network-online.target
+          Requires=containerd.service
+          [Service]
+          Type=notify
+          ExecStart=/usr/bin/dockerd --config-file=/etc/petar-acceptance-docker.json --data-root=/var/lib/petar-acceptance-docker --host=unix:///run/docker.sock --group=docker --containerd=/run/containerd/containerd.sock --containerd-namespace=petar-acceptance --containerd-plugins-namespace=petar-acceptance-plugins
+          TimeoutStartSec=120
+          Delegate=yes
+          KillMode=process
+      when: reuse_attested | default('no') != 'yes'
+
+    - name: Do not read host Docker configuration on the fresh guest
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/petar-acceptance-docker.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: "{}"
+      when: reuse_attested | default('no') != 'yes'
+
+    - name: Start the disposable guest daemon
+      become: true
+      ansible.builtin.systemd_service:
+        name: petar-acceptance-docker.service
+        daemon_reload: true
+        state: started
+      when: reuse_attested | default('no') != 'yes'
+
+    - name: Grant Docker group membership for the disposable operator
+      become: true
+      ansible.builtin.user:
+        name: "{{ verified_operator.stdout }}"
+        groups: docker
+        append: true
+
+    - name: Select GNU timeout without changing system coreutils
+      become: true
+      ansible.builtin.file:
+        src: /usr/bin/gnutimeout
+        dest: /usr/local/bin/timeout
+        state: link
+        owner: root
+        group: root
+
+    - name: Check the GNU timeout actually used by the operator
+      ansible.builtin.shell: /usr/local/bin/timeout --version | grep '^timeout (GNU coreutils)'
+      changed_when: false
+
+    - name: Prepare isolated fixture parents
+      become: true
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: "0755"
+      loop: "{{ fixture_parents }}"
+
+    - name: Prepare private empty operator directories
+      become: true
+      ansible.builtin.file:
+        path: "/opt/petar-data/{{ item }}/operator"
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: "0700"
+      loop: [dev, rehearsal, production]
+
+    - name: Prepare the separate root-owned browser installation
+      become: true
+      ansible.builtin.file:
+        path: "{{ smoke_home }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the pinned Chromium archive
+      become: true
+      ansible.builtin.get_url:
+        url: "https://storage.googleapis.com/chrome-for-testing-public/{{ chromium_version }}/linux64/chrome-headless-shell-linux64.zip"
+        dest: "{{ smoke_home }}/chromium.zip"
+        checksum: "sha256:{{ chromium_sha256 }}"
+        mode: "0644"
+
+    - name: Unpack Chromium
+      become: true
+      ansible.builtin.unarchive:
+        src: "{{ smoke_home }}/chromium.zip"
+        dest: "{{ smoke_home }}"
+        remote_src: true
+        owner: root
+        group: root
+
+    - name: Install the wheel-locked Playwright environment
+      become: true
+      ansible.builtin.pip:
+        requirements: "{{ playbook_dir }}/smoke-requirements.txt"
+        virtualenv: "{{ smoke_home }}/venv"
+        virtualenv_command: /usr/bin/python3 -m venv
+        extra_args: "--isolated --no-input --index-url https://pypi.org/simple --require-hashes --only-binary=:all:"
+
+    - name: Permit user namespaces for the pinned Chromium binary only
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/apparmor.d/petar-smoke-chromium
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile petar-smoke-chromium {{ smoke_home }}/chrome-headless-shell-linux64/chrome-headless-shell flags=(unconfined) {
+            userns,
+          }
+
+    - name: Load only the Chromium AppArmor profile
+      become: true
+      ansible.builtin.command: /usr/sbin/apparmor_parser -r /etc/apparmor.d/petar-smoke-chromium
+
+    - name: Write root-issued attestation after provisioning the guest
+      become: true
+      ansible.builtin.copy:
+        src: /etc/machine-id
+        remote_src: true
+        dest: /etc/petar-deploy-disposable
+        owner: root
+        group: root
+        mode: "0644"

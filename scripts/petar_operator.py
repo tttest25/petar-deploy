@@ -596,17 +596,23 @@ class Operator:
         self.stage = "maintenance lock"
         with self.lock("control.lock", LOCK_WAIT) as control:
             require(control is not None, "another control operation is active")
-            if self.marked("maintenance"):
-                require(resume and (self.state / "maintenance").read_bytes() == b"dev-stopped\n",
-                        "maintenance is paused; inspect the previous operation first")
-            else:
-                self.marker("maintenance", "operation-in-progress")
-            # Never leave a resumable marker while running a new operation.
-            if resume and (self.state / "maintenance").read_bytes() == b"dev-stopped\n":
-                self.replace_maintenance("operation-in-progress")
-            with self.lock("tick.lock", LOCK_WAIT) as tick:
-                require(tick is not None, "runner is still active; maintenance remains paused")
-                yield (control, tick)
+            with self.maintenance_under_control(control, resume=resume) as fds:
+                yield fds
+
+    @contextmanager
+    def maintenance_under_control(self, control, resume=False):
+        """Enter maintenance with an already-held control lock."""
+        if self.marked("maintenance"):
+            require(resume and (self.state / "maintenance").read_bytes() == b"dev-stopped\n",
+                    "maintenance is paused; inspect the previous operation first")
+        else:
+            self.marker("maintenance", "operation-in-progress")
+        # Never leave a resumable marker while running a new operation.
+        if resume and (self.state / "maintenance").read_bytes() == b"dev-stopped\n":
+            self.replace_maintenance("operation-in-progress")
+        with self.lock("tick.lock", LOCK_WAIT) as tick:
+            require(tick is not None, "runner is still active; maintenance remains paused")
+            yield (control, tick)
 
     def replace_maintenance(self, value):
         fd, name = tempfile.mkstemp(prefix=".maintenance-", dir=self.state)
@@ -770,6 +776,11 @@ class Operator:
                     "PGDATA or spool became nonempty during preparation")
             self.check_frozen(model)
             self.inventory(model, allow_own=False, check_ports=True)
+            self.stage = "initialize release spool directories"
+            # The spool bind hides the image's directories. The Go writer
+            # publishes into in/ immediately, before the host runner ever ticks.
+            for name in ("in", "processing", "out"):
+                (self.spool / name).mkdir(mode=0o700)
             self.stage = "start pinned release"
             self.compose("up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "180",
                          timeout=240, fds=fds, frozen=True)
