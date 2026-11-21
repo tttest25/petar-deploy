@@ -1,3 +1,4 @@
 /.local/
 .env
 *.env
+!/releases/001.env
