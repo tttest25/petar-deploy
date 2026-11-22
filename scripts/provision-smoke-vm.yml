@@ -3,11 +3,12 @@
   hosts: localhost
   connection: local
   gather_facts: false
+  vars_files:
+    - smoke-chromium.json
   vars:
     ansible_python_interpreter: /usr/bin/python3
     smoke_home: /opt/petar-smoke
-    chromium_version: 148.0.7778.96
-    chromium_sha256: 88817c574c1838a39f88fda0bbd043b4481fd385fb10e92c323e230844d636ce
+    chromium_archive: "{{ lookup('ansible.builtin.env', 'PETAR_CHROMIUM_ARCHIVE') }}"
     fixture_parents:
       - /opt/go-pet
       - /opt/go-pet/postgres
@@ -92,6 +93,16 @@
         REUSE_ATTESTED: "{{ reuse_attested | default('no') }}"
       changed_when: false
       register: verified_operator
+
+    - name: Require the staged Chromium archive before installing packages
+      ansible.builtin.stat:
+        path: "{{ chromium_archive }}"
+        checksum_algorithm: sha256
+      register: staged_chromium
+      failed_when: >-
+        not staged_chromium.stat.isreg | default(false) or
+        staged_chromium.stat.size != chromium_bytes or
+        staged_chromium.stat.checksum != chromium_sha256
 
     - name: Install guest-only prerequisites without package auto-start
       become: true
@@ -234,13 +245,24 @@
         group: root
         mode: "0755"
 
-    - name: Install the pinned Chromium archive
+    - name: Install the verified local Chromium archive
       become: true
-      ansible.builtin.get_url:
-        url: "https://storage.googleapis.com/chrome-for-testing-public/{{ chromium_version }}/linux64/chrome-headless-shell-linux64.zip"
+      ansible.builtin.copy:
+        src: "{{ chromium_archive }}"
         dest: "{{ smoke_home }}/chromium.zip"
-        checksum: "sha256:{{ chromium_sha256 }}"
+        owner: root
+        group: root
         mode: "0644"
+
+    - name: Recheck the installed Chromium archive before extraction
+      ansible.builtin.stat:
+        path: "{{ smoke_home }}/chromium.zip"
+        checksum_algorithm: sha256
+      register: installed_chromium
+      failed_when: >-
+        not installed_chromium.stat.isreg | default(false) or
+        installed_chromium.stat.size != chromium_bytes or
+        installed_chromium.stat.checksum != chromium_sha256
 
     - name: Unpack Chromium
       become: true

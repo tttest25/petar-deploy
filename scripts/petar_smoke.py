@@ -64,8 +64,9 @@ class Job:
 
 
 class Smoke:
-    def __init__(self, op, mode, browser, *, wait=None):
+    def __init__(self, op, mode, browser, *, wait=None, confirm_restart=False):
         self.op, self.mode, self.browser = op, mode, browser
+        self.confirm_restart = confirm_restart
         self.wait = wait if wait is not None else (40 if mode == "managed" else 150)
         self.stage = "target"
         self.jobs = (Job("echo-test", "echo", "petar-smoke-" + str(uuid4())), Job("word-count", "words", 3))
@@ -98,6 +99,19 @@ class Smoke:
         check(names <= {job + suffix for job in expected for suffix in (".json", ".tmp")},
               "managed rehearsal queue contains unrelated work")
         return names == {job + ".json" for job in expected}
+
+    def require_idle(self):
+        with self.op.lock("tick.lock", 0) as tick:
+            check(tick is not None and self.queued(), "managed rehearsal runner or queue is busy")
+            result = self.op.compose(
+                "exec", "-T", "postgres", "psql", "-XqAt", "-v", "ON_ERROR_STOP=1",
+                "-U", "petar_user", "-d", "petar_db", "-c", "BEGIN READ ONLY; "
+                "SELECT NOT EXISTS (SELECT 1 FROM public.sm_jobs "
+                "WHERE status IN ('pending', 'dispatched', 'in_progress')); COMMIT;",
+                frozen=True, timeout=15, allow_fail=True,
+            )
+            check(not result.returncode and result.stdout.strip() == b"t",
+                  "database queue has unfinished work or could not be checked")
 
     def api(self, *, boot=False):
         op = self.op
@@ -209,13 +223,13 @@ class Smoke:
             started = identity(self.target())
             if self.mode == "managed":
                 self.stage = "managed runner"
-                marker = op.state / "smoke-managed"
-                ops.private_file(marker)
-                check(marker.read_bytes() == b"dedicated rehearsal runner\n",
-                      "expected explicit dedicated rehearsal runner")
+                if not self.confirm_restart:
+                    marker = op.state / "smoke-managed"
+                    ops.private_file(marker)
+                    check(marker.read_bytes() == b"dedicated rehearsal runner\n",
+                          "expected explicit dedicated rehearsal runner")
                 op.check_tools(False)
-                with op.lock("tick.lock", 0) as tick:
-                    check(tick is not None and self.queued(), "managed rehearsal runner or queue is busy")
+                self.require_idle()
             self.api()
             self.stage = "browser prerequisite"
             with self.browser(op) as browser:
@@ -223,8 +237,7 @@ class Smoke:
                 with browser.session() as session:
                     if self.mode == "managed":
                         self.stage = "managed runner"
-                        with op.lock("tick.lock", 0) as tick:
-                            check(tick is not None and self.queued(), "managed rehearsal runner or queue is busy")
+                        self.require_idle()
                     for job in self.jobs:
                         self.stage = f"wiki submit {job.action}"
                         self.active()
@@ -264,13 +277,16 @@ def main(args, operator=ops.Operator, browser=None, *, wait=None):
     try:
         modes = {
             ("rehearsal", "deploy-001"): "managed",
+            ("rehearsal", "deploy-001", "--confirm-restart"): "managed",
             ("rehearsal", "deploy-001", "--scheduled"): "scheduled",
             ("production", "deploy-001"): "scheduled",
         }
         mode = modes.get(tuple(args))
-        check(mode is not None, "usage: smoke.sh rehearsal deploy-001 [--scheduled] | production deploy-001")
+        check(mode is not None,
+              "usage: smoke.sh rehearsal deploy-001 [--scheduled|--confirm-restart] | production deploy-001")
         smoke = Smoke(operator(args[0]), mode,
-                      browser or (lambda op: sibling("petar_smoke_browser").chromium(op)), wait=wait)
+                      browser or (lambda op: sibling("petar_smoke_browser").chromium(op)), wait=wait,
+                      confirm_restart=tuple(args) == ("rehearsal", "deploy-001", "--confirm-restart"))
         smoke.run()
         return 0
     except Failure as err:

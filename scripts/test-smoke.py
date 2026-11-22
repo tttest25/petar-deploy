@@ -45,10 +45,13 @@ class Fixture:
         self.runtime_file.touch()
         self.runner_env = {}
         self.local = {"WIKI_CHECK_PASSWORD": PASSWORD}
+        self.db_checks = 0
         if defect in ("pause", "maintenance"):
             (self.state / defect).touch()
         if defect == "queue":
             (self.spool / "in" / f"{uid(300)}.json").touch()
+        if defect == "no marker":
+            (self.state / "smoke-managed").unlink()
 
     def operator(self, profile):
         self.profile = profile
@@ -61,6 +64,9 @@ class Fixture:
     @contextmanager
     def lock(self, name, _wait):
         assert name not in self.locks
+        if name == "tick.lock" and self.defect == "runner locked":
+            yield None
+            return
         self.locks.add(name)
         self.events.append(("lock", name))
         try:
@@ -139,9 +145,18 @@ class Fixture:
             yield (control, tick)
 
     def compose(self, *args, **options):
-        assert self.profile == "rehearsal" and options["frozen"] and options["fds"] == (9, 9)
-        assert args == ("restart", "--timeout", "30", "postgres", "app", "dokuwiki")
+        assert self.profile == "rehearsal" and options["frozen"]
         assert self.locks == {"control.lock", "tick.lock"}
+        if args[:4] == ("exec", "-T", "postgres", "psql"):
+            assert "BEGIN READ ONLY" in args[-1] and "public.sm_jobs" in args[-1]
+            assert all(status in args[-1] for status in ("pending", "dispatched", "in_progress"))
+            self.db_checks += 1
+            self.events.append(("db queue",))
+            busy = self.defect == "database queue" or self.defect == "late database queue" and self.db_checks == 2
+            return SimpleNamespace(returncode=int(self.defect == "database error"),
+                                   stdout=b"f\n" if busy else b"t\n")
+        assert options["fds"] == (9, 9)
+        assert args == ("restart", "--timeout", "30", "postgres", "app", "dokuwiki")
         self.events.append(("restart",))
         if self.defect != "no restart":
             self.starts += 1
@@ -232,6 +247,41 @@ class Contracts(unittest.TestCase):
                                         capture_output=True, timeout=5)
                 self.assertNotEqual(public.returncode, 0)
                 self.assertIn(b"No submission ID received", public.stderr)
+
+    def test_retest_wrapper_requires_restart_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            retest = root / "retest-rehearsal.sh"
+            retest.write_bytes((smoke.ops.ROOT / "scripts" / retest.name).read_bytes())
+            (root / "smoke.sh").write_text("printf '%s\\n' \"$@\"\n")
+            call = ["/bin/bash", str(retest)]
+            for args in ([], ["--scheduled"], ["--confirm-restart", "production"]):
+                refused = subprocess.run(call + args, capture_output=True, timeout=5)
+                self.assertEqual(refused.returncode, 2)
+                self.assertEqual(refused.stdout, b"")
+            confirmed = subprocess.run(call + ["--confirm-restart"], capture_output=True, timeout=5)
+            self.assertEqual(confirmed.returncode, 0)
+            self.assertEqual(confirmed.stdout, b"rehearsal\ndeploy-001\n--confirm-restart\n")
+
+    def test_confirmed_retest_without_marker_uses_same_jobs_after_restart(self):
+        args = ("rehearsal", "deploy-001", "--confirm-restart")
+        code, transcript, events = self.run_smoke(args, "no marker")
+        self.assertEqual(code, 0, transcript)
+        self.assertEqual(events.count(("db queue",)), 2)
+        self.assertEqual(events.count(("runner",)), 1)
+        self.assertEqual(events.count(("restart",)), 1)
+        self.assertEqual([e for e in events if e[0] == "result"],
+                         [("result", session, uid(job)) for session in (1, 2) for job in (3, 6)])
+        self.failure("no marker", "managed runner", args=args[:-1], submits=0)
+
+    def test_retest_refuses_work_before_any_submission(self):
+        args = ("rehearsal", "deploy-001", "--confirm-restart")
+        for defect in ("queue", "runner locked", "database queue", "late database queue", "database error"):
+            with self.subTest(defect=defect):
+                self.failure(defect, "managed runner", args=args, submits=0)
+        for defect in ("maintenance", "pause"):
+            with self.subTest(defect=defect):
+                self.failure(defect, "target", args=args, submits=0)
 
     def test_production_success_never_runs_tick_or_restart(self):
         code, transcript, events = self.run_smoke(("production", "deploy-001"))
