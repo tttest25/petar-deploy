@@ -25,7 +25,7 @@ SUCCESS = "isolated: passed (real release, real Chromium, two submissions and po
 GUEST_STAGES = ("attestation", "test fixtures", "public preflight", "public installation",
                 "public browser smoke", "release evidence", "cleanup")
 SMOKE_STAGES = ("target", "managed runner", "API readiness", "API catalog", "browser prerequisite",
-                "wiki login before submit", "wiki submit echo-test", "wiki submit word-count",
+                "wiki login before submit", "wiki journal capacity", "wiki submit echo-test", "wiki submit word-count",
                 "runner preparation journal", "runner pass", "before restart journal",
                 "before restart publication echo-test", "before restart publication word-count",
                 "rehearsal restart", "wiki readiness after restart", "wiki login after restart",

@@ -235,6 +235,8 @@ class Smoke:
             with self.browser(op) as browser:
                 self.stage = "wiki login before submit"
                 with browser.session() as session:
+                    self.stage = "wiki journal capacity"
+                    session.require_journal_capacity(time.monotonic() + self.wait, len(self.jobs))
                     if self.mode == "managed":
                         self.stage = "managed runner"
                         self.require_idle()

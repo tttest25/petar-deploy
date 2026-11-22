@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -18,6 +19,7 @@ spec = importlib.util.spec_from_file_location("petar_smoke", Path(__file__).with
 smoke = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = smoke
 spec.loader.exec_module(smoke)
+browser = smoke.sibling("petar_smoke_browser")
 
 PASSWORD, COOKIE, TOKEN = "fixture-password-987", "fixture-cookie-543", "fixture-csrf-210"
 PRIVATE = " ".join((PASSWORD, COOKIE, TOKEN))
@@ -187,6 +189,12 @@ class Fixture:
         job.input_id = uid(self.submits * 3 - 2)
         job.process_id = uid(self.submits * 3 - 1)
 
+    def require_journal_capacity(self, _deadline, reserve):
+        assert self.locks == {"control.lock"} and reserve == 2
+        self.events.append(("journal capacity",))
+        if self.defect == "full journal":
+            raise smoke.Failure("journal has no room for the smoke jobs within the scan limit")
+
     def journal(self, _deadline, jobs):
         assert self.locks == {"control.lock"}
         self.events.append(("journal", self.sessions))
@@ -282,6 +290,51 @@ class Contracts(unittest.TestCase):
         for defect in ("maintenance", "pause"):
             with self.subTest(defect=defect):
                 self.failure(defect, "target", args=args, submits=0)
+
+    def test_full_journal_is_refused_before_any_submission(self):
+        for args in (("rehearsal", "deploy-001", "--confirm-restart"), ("production", "deploy-001")):
+            with self.subTest(args=args):
+                transcript, events = self.failure("full journal", "wiki journal capacity", args=args, submits=0)
+                self.assertIn("journal has no room", transcript)
+                self.assertIn(("journal capacity",), events)
+                self.assertNotIn(("runner",), events)
+
+    def test_browser_journal_reserves_two_slots_at_page_boundary(self):
+        class Journal(browser.Session):
+            def __init__(self, entries):
+                self.log = self
+                self.entries = entries
+                self.pages = 0
+
+            def locator(self, _name):
+                return self
+
+            def wait_for(self, **_):
+                pass
+
+            def is_visible(self):
+                return self.entries > 0
+
+            def click(self, _locator, action, **_):
+                assert action == "jobs"
+                self.pages += 1
+                rows = min(self.entries, 20)
+                self.entries -= rows
+                return SimpleNamespace(status=200, json=lambda: {
+                    "jobs": [{}] * rows, "next_cursor": "next" if self.entries else None,
+                })
+
+        for count in (0, 498):
+            with self.subTest(count=count):
+                journal = Journal(count)
+                journal.require_journal_capacity(time.monotonic() + 5, 2)
+                self.assertEqual(journal.pages, max(1, (count + 19) // 20))
+        for count in (499, 500, 501):
+            with self.subTest(count=count):
+                journal = Journal(count)
+                with self.assertRaisesRegex(smoke.Failure, "journal has no room"):
+                    journal.require_journal_capacity(time.monotonic() + 5, 2)
+                self.assertEqual(journal.pages, 25)
 
     def test_production_success_never_runs_tick_or_restart(self):
         code, transcript, events = self.run_smoke(("production", "deploy-001"))

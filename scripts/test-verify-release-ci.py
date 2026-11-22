@@ -87,6 +87,11 @@ class DiagnosticTest(unittest.TestCase):
         self.assertEqual(code, 77)
         self.assertIn("guest_failure_stage=attestation", log)
 
+    def test_journal_capacity_failure_is_reported_without_details(self):
+        code, log = self.run_guest(f"rehearsal: wiki journal capacity: FAILED: {MARKER}", 1)
+        self.assertEqual(code, 1)
+        self.assertIn("browser_failure_stage=wiki journal capacity", log)
+
     def test_cleanup_failure_never_passes(self):
         failure = f"isolated: FAILED (cleanup): {MARKER}"
         body = transcript().replace(ci.CLEANUP, failure).replace(ci.SUCCESS + "\n", "")

@@ -16,6 +16,8 @@ from petar_smoke import ACTIONS, BROWSER, CHROMIUM, PLAYWRIGHT, Failure, check, 
 WIKI_PAGE = "/doku.php?id=petar_check"
 AJAX = "/lib/exe/ajax.php"
 LIMIT = 18_000  # The pinned plugin aborts AJAX at 15 seconds.
+JOURNAL_PAGES = 25
+JOURNAL_PAGE_SIZE = 20  # JOB_PAGE_SIZE in the pinned PHP plugin.
 
 
 @contextmanager
@@ -164,26 +166,39 @@ class Session:
 
     def journal(self, deadline, jobs):
         wanted = [job.process_id for job in jobs]
+        return self.scan_journal(deadline, wanted)
+
+    def require_journal_capacity(self, deadline, reserve):
+        self.scan_journal(deadline, (), reserve=reserve)
+
+    def scan_journal(self, deadline, wanted, *, reserve=0):
         button = self.log.locator(".petar-jobs-refresh")
         more = self.log.locator(".petar-jobs-more")
-        for _ in range(25):  # Disallow partial scans masquerading as unique matches.
+        count = 0
+        for _ in range(JOURNAL_PAGES):  # Disallow partial scans masquerading as unique matches.
             timeout = min(LIMIT, max(1, int((deadline - time.monotonic()) * 1000)))
             check(timeout > 1, "timed out reading the smoke journal")
             response = self.click(button, "jobs", timeout=timeout)
             check(response.status == 200, f"wiki journal HTTP {response.status}")
             self.log.locator('.petar-jobs-table[aria-busy="false"]').wait_for(state="attached", timeout=timeout)
             page = response.json()
-            check(isinstance(page.get("jobs"), list) and "next_cursor" in page, "invalid journal response")
+            check(isinstance(page.get("jobs"), list) and len(page["jobs"]) <= JOURNAL_PAGE_SIZE
+                  and "next_cursor" in page, "invalid journal response")
+            count += len(page["jobs"])
+            if reserve:
+                check(count + reserve <= JOURNAL_PAGES * JOURNAL_PAGE_SIZE,
+                      "journal has no room for the smoke jobs within the scan limit")
             for row in page["jobs"]:
                 if row.get("process_id") in wanted and row.get("status") == "failed":
                     # Let the controller correlate and report the failed row immediately.
                     return self.own_rows(wanted)
             if page["next_cursor"] is None:
                 check(not more.is_visible(), "journal pagination mismatch")
-                return self.own_rows(wanted)
+                return self.own_rows(wanted) if wanted else None
             check(more.is_visible(), "journal pagination unavailable")
             button = more
-        check(False, "journal exceeds the bounded scan")
+        check(False, "journal has no room for the smoke jobs within the scan limit"
+              if reserve else "journal exceeds the bounded scan")
 
     def own_rows(self, ids):
         # No contents of another user's/process's row leave the browser.
